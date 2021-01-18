@@ -239,9 +239,9 @@ func (s *podStep) generatePodForStep(image string, containerResources coreapi.Re
 	}
 	pod.Spec.ServiceAccountName = s.config.ServiceAccountName
 	container := &pod.Spec.Containers[0]
-	for _, secret := range s.config.Secrets {
-		container.VolumeMounts = append(container.VolumeMounts, getSecretVolumeMountFromSecret(secret.MountPath)...)
-		pod.Spec.Volumes = append(pod.Spec.Volumes, getVolumeFromSecret(secret.Name)...)
+	for i, secret := range s.config.Secrets {
+		container.VolumeMounts = append(container.VolumeMounts, getSecretVolumeMountFromSecret(secret.MountPath, i)...)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, getVolumeFromSecret(secret.Name, i)...)
 	}
 
 	if v := s.config.MemoryBackedVolume; v != nil {
@@ -268,10 +268,10 @@ func (s *podStep) generatePodForStep(image string, containerResources coreapi.Re
 	return pod, nil
 }
 
-func getVolumeFromSecret(secretName string) []coreapi.Volume {
+func getVolumeFromSecret(secretName string, secretIndex int) []coreapi.Volume {
 	return []coreapi.Volume{
 		{
-			Name: testSecretName,
+			Name: fmt.Sprintf("%s-%d", testSecretName, secretIndex),
 			VolumeSource: coreapi.VolumeSource{
 				Secret: &coreapi.SecretVolumeSource{
 					SecretName: secretName,
@@ -281,13 +281,13 @@ func getVolumeFromSecret(secretName string) []coreapi.Volume {
 	}
 }
 
-func getSecretVolumeMountFromSecret(secretMountPath string) []coreapi.VolumeMount {
+func getSecretVolumeMountFromSecret(secretMountPath string, secretIndex int) []coreapi.VolumeMount {
 	if secretMountPath == "" {
 		secretMountPath = testSecretDefaultPath
 	}
 	return []coreapi.VolumeMount{
 		{
-			Name:      testSecretName,
+			Name:      fmt.Sprintf("%s-%d", testSecretName, secretIndex),
 			ReadOnly:  true,
 			MountPath: secretMountPath,
 		},
