@@ -261,7 +261,6 @@ func buildFromSource(jobSpec *api.JobSpec, fromTag, toTag api.PipelineImageStrea
 			Name:      fmt.Sprintf("%s:%s", api.PipelineImageStream, fromTag),
 		}
 	}
-
 	layer := buildapi.ImageOptimizationSkipLayers
 	labels := defaultPodLabels(jobSpec)
 	labels[CreatesLabel] = string(toTag)
@@ -285,7 +284,11 @@ func buildFromSource(jobSpec *api.JobSpec, fromTag, toTag api.PipelineImageStrea
 						From:                    from,
 						ForcePull:               true,
 						NoCache:                 true,
-						Env:                     []corev1.EnvVar{{Name: "BUILD_LOGLEVEL", Value: "0"}}, // this mirrors the default and is done for documentary purposes
+						Env:                     []corev1.EnvVar{
+							{Name: "BUILD_LOGLEVEL", Value: "0"},
+							{Name: openshiftCIEnv, Value: "true"},
+							{Name: "OPENSHIFT_JOB_NAME", Value: jobSpec.Job},
+						}, // this mirrors the default and is done for documentary purposes
 						ImageOptimizationPolicy: &layer,
 					},
 				},
