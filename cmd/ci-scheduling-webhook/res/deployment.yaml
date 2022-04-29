@@ -25,6 +25,8 @@ metadata:
   name: ci-scheduling-admission-webhook
   namespace: ci-scheduling-webhook
 spec:
+  # There is some state stored for assumed pods.
+  # Prefer vertical to horizontal scaling.
   replicas: 1
   selector:
     matchLabels:
