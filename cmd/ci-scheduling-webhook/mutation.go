@@ -105,7 +105,7 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 
 	profile("decoded request")
 
-	podClass := "" // will be set to CiWorkloadLabelValueBuilds or CiWorkloadLabelValueTests depending on analysis
+	podClass := PodClassNone // will be set to CiWorkloadLabelValueBuilds or CiWorkloadLabelValueTests depending on analysis
 
 	patchEntries := make([]map[string]interface{}, 0)
 	addPatchEntry := func(op string, path string, value interface{}) {
@@ -166,21 +166,19 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 
 		if !skipPod {
 			if _, ok := labels[CiBuildNameLabelName]; ok {
-				podClass = CiWorkloadLabelValueBuilds
+				podClass = PodClassBuilds
 			} else {
-				podClass = CiWorkloadLabelValueTests
+				podClass = PodClassTests
 			}
 		}
 	}
 
-	if podClass != "" {
+	if podClass != PodClassNone {
 		profile("classified request")
 
 		// Setup labels we might want to use in the future to set pod affinity
-		labels[CiWorkloadLabelName] = podClass
+		labels[CiWorkloadLabelName] = string(podClass)
 		labels[CiWorkloadNamespaceLabelName] = namespace
-
-		addPatchEntry("add", "/metadata/labels", labels)
 
 		// Reduce CPU requests, if appropriate
 		reduceCPURequests := func(containerType string, containers []corev1.Container, factor float32) {
@@ -204,6 +202,7 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+
 		var cpuFactor float32
 		if podClass == CiWorkloadLabelValueTests {
 			cpuFactor = shrinkTestCPU
@@ -220,7 +219,7 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 
 		// Set a nodeSelector to ensure this finds our desired machineset nodes
 		nodeSelector := make(map[string]string)
-		nodeSelector[CiWorkloadLabelName] = podClass
+		nodeSelector[CiWorkloadLabelName] = string(podClass)
 		addPatchEntry("add", "/spec/nodeSelector", nodeSelector)
 
 		// Set up a softNodeAffinity to try to deterministically schedule this Pod
@@ -234,9 +233,15 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 
 			affinityChanged := false
-			affinity := corev1.Affinity{
-				NodeAffinity: &corev1.NodeAffinity{},
+			var affinity *corev1.Affinity
+			if pod.Spec.Affinity != nil {
+				affinity = pod.Spec.Affinity
+			} else {
+				affinity = &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{},
+				}
 			}
+
 
 			if len(excludedNodes) > 0 {
 				excludedHostnames := make([]string, 0)
@@ -268,6 +273,47 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 					affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &requiredNoSchedulingSelector
 					affinityChanged = true
 				}
+
+				// If nodes were excluded, but none suggested, engage theory nodes!
+				if len(orderedNodeNames) == 0 {
+					// webhook may be reinvoked, so don't count this pod in theory nodes twice. Just keep old pod antiaffinity
+					// from incomingPod. Requested may have increased, but it is not worth the complexity to figure that out.
+					if _, ok := labels[CiTheoryNodeLabel]; !ok {
+						exemplarNode := excludedNodes[0]
+						// No node was found, so start working on theory nodes
+						theoryNodeKey, antiAffinityKeys := fitPodToTheoryNode(podClass, exemplarNode.Status.Allocatable.Cpu().MilliValue(), &pod)
+						profile("assessed theory nodes")
+						labels[CiTheoryNodeLabel] = fmt.Sprintf("%v", theoryNodeKey.UnixNano())
+
+						if len(antiAffinityKeys) > 0 {
+							avoidKeys := make([]string, len(antiAffinityKeys))
+							for i, tm := range antiAffinityKeys {
+								avoidKeys[i] = fmt.Sprintf("%v", tm.UnixNano())
+							}
+							if len(avoidKeys) > 50 {
+								// Things must be wild. We've filled 50 theoretical nodes. Just cap so
+								// that the pod spec doesn't grow too lage.
+								avoidKeys = avoidKeys[:50]
+							}
+							affinity.PodAntiAffinity = &corev1.PodAntiAffinity{}
+							affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = []corev1.PodAffinityTerm {
+								{
+									LabelSelector:     &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement {
+											{
+												Key:      CiTheoryNodeLabel,
+												Operator: "NotIn",
+												Values:   avoidKeys,
+											},
+										} ,
+									},
+									TopologyKey: "topology.kubernetes.io/region",
+								},
+							}
+							affinityChanged = true
+						}
+					}
+				}
 			}
 
 			if len(orderedNodeNames) > 0 {
@@ -297,6 +343,7 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 				affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = preferredSchedulingTerms
 				affinityChanged = true
 			}
+
 			if affinityChanged {
 				unstructuredAffinity, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&affinity)
 				if err != nil {
@@ -306,10 +353,14 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 
 				addPatchEntry("add", "/spec/affinity", unstructuredAffinity)
 			}
+
 		} else {
 			klog.Errorf("No node affinity will be set in pod due to error: %v", err)
 		}
+
+		addPatchEntry("add", "/metadata/labels", labels)
 	}
+
 
 	// Create a response that will add a label to the pod if it does
 	// not already have a label with the key of "hello". In this case

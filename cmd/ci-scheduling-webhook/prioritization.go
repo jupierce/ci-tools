@@ -17,7 +17,15 @@ import (
 )
 
 const (
-	CiTheoryNodePrefix = "ci-theory-node-"
+	CiTheoryNodeLabel = "ci-theory-node"
+)
+
+type PodClass string
+
+const (
+	PodClassBuilds PodClass = "builds"
+	PodClassTests PodClass = "tests"
+	PodClassNone PodClass = ""
 )
 
 var (
@@ -26,9 +34,13 @@ var (
 	assumedPodAssignment sync.Map // map[nodeName String]*map[podName String]*Pod
 	nodesInformer  cache.SharedIndexInformer
 	podsInformer   cache.SharedIndexInformer
+
+	theoryMutex sync.Mutex
+	theoryNodeClasses map[PodClass]*sync.Map // sync.Map is map[time.Time]int64
 )
 
 const IndexPodsByNode = "IndexPodsByNode"
+const IndexPodsByTheoryNode = "IndexByTheoryNode"
 const IndexNodesByCiWorkload = "IndexNodesByCiWorkload"
 
 func getPodFromInformer(qualifiedPodName string) (*corev1.Pod, error) {
@@ -104,7 +116,7 @@ func pruneScheduledAssumedPods(nodeName string, excludePod *corev1.Pod) (remaini
 }
 
 func initializePrioritization(ctx context.Context, k8sClientSet *kubernetes.Clientset, metricsClientSet *metrics.Clientset) error {
-
+	theoryNodeClasses = make(map[PodClass]*sync.Map, 0)
 	informerFactory := informers.NewSharedInformerFactory(k8sClientSet, 0)
 	nodesInformer = informerFactory.Core().V1().Nodes().Informer()
 
@@ -128,13 +140,29 @@ func initializePrioritization(ctx context.Context, k8sClientSet *kubernetes.Clie
 	// Index pods by the nodes they are assigned to
 	err = podsInformer.AddIndexers(map[string]cache.IndexFunc{
 		IndexPodsByNode: func(obj interface{}) ([]string, error) {
-			nodeNames := []string{obj.(*corev1.Pod).Spec.NodeName}
+			pod := obj.(*corev1.Pod)
+			nodeNames := []string{pod.Spec.NodeName}
 			return nodeNames, nil
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("unable to create new %v informer index: %v", IndexPodsByNode, err)
+	}
+
+	// Index pods by their theory node labels
+	err = podsInformer.AddIndexers(map[string]cache.IndexFunc{
+		IndexPodsByTheoryNode: func(obj interface{}) ([]string, error) {
+			pod := obj.(*corev1.Pod)
+			theoryNodeNames := []string{""}
+			if val, ok := pod.Labels[CiTheoryNodeLabel]; ok {
+				theoryNodeNames[0] = val
+			}
+			return theoryNodeNames, nil
 		},
 	})
 
 	if err != nil {
-		return fmt.Errorf("unable to create new pod informer index: %v", err)
+		return fmt.Errorf("unable to create new %v informer index: %v", IndexPodsByTheoryNode, err)
 	}
 
 	stopCh := make(chan struct{})
@@ -172,6 +200,7 @@ func initializePrioritization(ctx context.Context, k8sClientSet *kubernetes.Clie
 		//  1. metrics for nodes that are no longer around
 		//  2. calculated pod requests for pods that are no longer present / running
 		//  3. Assumed pod assignments
+		//  4. Theory node information
 		for range time.Tick(time.Second * 60) {
 
 			nodeMetricsCount := 0
@@ -220,12 +249,105 @@ func initializePrioritization(ctx context.Context, k8sClientSet *kubernetes.Clie
 				return true
 			})
 
+			theoryNodeCount := 0
+			theoryMutex.Lock()
+			for _, theoryNodes := range theoryNodeClasses {
+				theoryNodes.Range(func(key interface{}, value interface{}) bool {
+					theoryNodeCount++
+					created := key.(time.Time)
+					pod, _ := podsInformer.GetIndexer().ByIndex(IndexPodsByTheoryNode, fmt.Sprintf("%v", created.UnixNano()))
+					if pod != nil {
+						// A pod has been scheduled on a once theoretical node. Forget about it the theory node now.
+						klog.InfoS("Removing theory node that has manifested", "theoryNodeKey", created.UnixNano())
+						theoryNodes.Delete(key)
+					}
+					if theoryNodeCount > 50 {
+						klog.Errorf("Greater than 50 theory nodes. There was an avalanche of pods or a logic problem with the webhook.")
+						theoryNodes.Delete(key)
+					}
+					if time.Now().Sub(created) > 20 * time.Minute {
+						// The anticipated node has not arrived in 20 minutes? Just avoid the memory leak.
+						klog.Errorf("Deleting 20 minute old theory node. Scaling not working? Something worse?")
+						theoryNodes.Delete(key)
+					}
+					return true
+				})
+			}
+			theoryMutex.Unlock()
+
 			// None of these should grow disproportionally to the number of pods / nodes in the system.
-			klog.InfoS("Caching metrics", "assumedPods", assumedPodsCount, "cachedPodRequests", cachedPodRequests, "cachedNodeMetrics", nodeMetricsCount)
+			klog.InfoS("Caching metrics", "assumedPods", assumedPodsCount, "cachedPodRequests", cachedPodRequests, "cachedNodeMetrics", nodeMetricsCount, "theoryNodeCount", theoryNodeCount)
 		}
 	}()
 
 	return nil
+}
+
+func fitPodToTheoryNode(podClass PodClass, targetNodesAllocatable int64, pod *corev1.Pod) (time.Time, []time.Time) {
+	theoryMutex.Lock()
+	defer theoryMutex.Unlock()
+
+	podCpuRequests := calculatePodCPUMillisRequest(pod, true)
+	podName := pod.Namespace + "/" + pod.Name
+
+	theoryNodeMap, ok := theoryNodeClasses[podClass]
+	if !ok {
+		theoryNodeMap = &sync.Map{}
+		theoryNodeClasses[podClass] = theoryNodeMap
+	}
+
+	keys := make([]time.Time, 0)
+	theoryNodeMap.Range(func(key interface{}, value interface{}) bool {
+		keys = append(keys, key.(time.Time))
+		return true
+	})
+
+	sort.Slice(keys, func(i int, j int) bool {
+		return keys[i].Before(keys[j])
+	})
+
+	key := time.Now()
+	var theoryAllocated int64 // how much of a theoretical node's CPU has been requested
+	createNewTheoryNode := true
+	if len(keys) != 0 { // if there is at least one theory node, see if we can allocate the pod to it
+		key = keys[len(keys) - 1]            // the newest theory node should have allocatable space remaining
+		ta, _ := theoryNodeMap.Load(key) // adopt the theoretical allocated from the newest theory node
+		theoryAllocated = ta.(int64)
+		onceAllocatedPercent := 100 * (theoryAllocated + podCpuRequests) / targetNodesAllocatable
+
+		klog.InfoS("Trying to fit existing theory node", "pod", podName, "theoryNodeKey", key.UnixNano(), "theoryAllocated", theoryAllocated, "onceAllocatedPercent", onceAllocatedPercent )
+
+		if  onceAllocatedPercent < 100 {
+			if onceAllocatedPercent > 90 {
+				// The incoming pod would drive requests for our theoretical node to over 90%
+				if 100 * podCpuRequests / targetNodesAllocatable > 50 {
+					// The incoming pod will own a majority of the CPU, so this is a big pod. Just
+					// land it somewhere.
+					createNewTheoryNode = false
+				}
+			} else {
+				// there should be space on the newest theory node
+				createNewTheoryNode = false
+			}
+		} // else, we definitely need a new theory node
+	}
+
+	exhaustedTheoryNodeKeys := make([]time.Time, 0)
+	if createNewTheoryNode {
+		exhaustedTheoryNodeKeys = keys // all existing keys are spent
+		key = time.Now()
+		klog.InfoS("Created new theory node", "pod", podName, "theoryNodeKey", key.UnixNano(), "exhaustedKeys", len(exhaustedTheoryNodeKeys))
+		theoryAllocated = 0
+	} else {
+		if len(keys) > 1 {
+			exhaustedTheoryNodeKeys = keys[:len(keys)-1]
+		}
+		theoryAllocated += podCpuRequests
+		klog.InfoS("Updated new theory node requested CPU", "pod", podName, "theoryNodeKey", key.UnixNano(), "requestedMillis", theoryAllocated, "exhaustedKeys", len(exhaustedTheoryNodeKeys))
+	}
+
+	theoryNodeMap.Store(key, theoryAllocated)
+	return key, exhaustedTheoryNodeKeys
 }
 
 func isNodeReady(node *corev1.Node) bool {
@@ -244,8 +366,8 @@ func isNodeReady(node *corev1.Node) bool {
 
 // getWorkloadNodes returns all nodes presently available which support a given
 // podClass (workload type).
-func getWorkloadNodes(podClass string) ([]*corev1.Node, error) {
-	items, err := nodesInformer.GetIndexer().ByIndex(IndexNodesByCiWorkload, podClass)
+func getWorkloadNodes(podClass PodClass) ([]*corev1.Node, error) {
+	items, err := nodesInformer.GetIndexer().ByIndex(IndexNodesByCiWorkload, string(podClass))
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +409,7 @@ func getPodsUsingNode(nodeName string, excludePod *corev1.Pod) ([]*corev1.Pod, [
 	return pods, assumedPods, nil
 }
 
-func computePodCPUMillisRequest(pod *corev1.Pod, useCache bool) int64 {
+func calculatePodCPUMillisRequest(pod *corev1.Pod, useCache bool) int64 {
 	if pod.Name == "" || pod.Namespace == "" {
 		// Incoming pods may not specify their names and expect the server to generate one.
 		// Avoid using cached calculations for such pods.
@@ -339,7 +461,7 @@ func computePodCPUMillisRequest(pod *corev1.Pod, useCache bool) int64 {
 // heavily utilized.
 func filterWorkloadNodes(workloadNodes []*corev1.Node, pod *corev1.Pod) ([]*corev1.Node, []*corev1.Node, error) {
 	// Don't use cache for incoming pod. It's possible it was recreated under the same name.
-	incomingPodCpuMillis := computePodCPUMillisRequest(pod, false)
+	incomingPodCpuMillis := calculatePodCPUMillisRequest(pod, false)
 	filteredList := make([]*corev1.Node, 0)
 	execludedList := make([]*corev1.Node, 0)
 
@@ -357,11 +479,11 @@ func filterWorkloadNodes(workloadNodes []*corev1.Node, pod *corev1.Pod) ([]*core
 		var scheduledPodsRequestedMillis int64
 		var assumedPodsRequestedMillis int64
 		for _, scheduledPod := range scheduledPods {
-			scheduledPodsRequestedMillis += computePodCPUMillisRequest(scheduledPod, true)
+			scheduledPodsRequestedMillis += calculatePodCPUMillisRequest(scheduledPod, true)
 		}
 
 		for _, assumedPod := range assumedPods {
-			assumedPodsRequestedMillis += computePodCPUMillisRequest(assumedPod, true)
+			assumedPodsRequestedMillis += calculatePodCPUMillisRequest(assumedPod, true)
 		}
 
 		// For the purposes of our calculations, we calculate assumed pods as if they were scheduled.
@@ -454,7 +576,7 @@ func filterWorkloadNodes(workloadNodes []*corev1.Node, pod *corev1.Pod) ([]*core
 	return filteredList, execludedList, nil
 }
 
-func getNodeNamesInPreferredOrder(podClass string, pod *corev1.Pod) ([]string, []*corev1.Node, error) {
+func getNodeNamesInPreferredOrder(podClass PodClass, pod *corev1.Pod) ([]string, []*corev1.Node, error) {
 	possibleNodes, err := getWorkloadNodes(podClass)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error finding workload nodes: %v", err)
