@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -477,6 +478,15 @@ type Getter interface {
 	coreclientset.NamespacesGetter
 }
 
+func sanitizeAlphaNum(toVerify string) string {
+	var validAlphaNum = regexp.MustCompile(`^[A-Za-z0-9-_]+$`)
+	if validAlphaNum.MatchString(toVerify) {
+		return toVerify
+	} else {
+		return "INVALID"
+	}
+}
+
 func updateSecrets(getters map[string]Getter, secretsMap map[string][]*coreapi.Secret, force bool, confirm bool) error {
 	var errs []error
 
@@ -487,7 +497,7 @@ func updateSecrets(getters map[string]Getter, secretsMap map[string][]*coreapi.S
 	}
 
 	for cluster, secrets := range secretsMap {
-		logger := logrus.WithField("cluster", cluster)
+		logger := logrus.WithField("cluster", sanitizeAlphaNum(cluster))
 		logger.Debug("Syncing secrets for cluster")
 		for _, secret := range secrets {
 			logger := logger.WithFields(logrus.Fields{"namespace": secret.Namespace, "name": secret.Name, "type": secret.Type})
