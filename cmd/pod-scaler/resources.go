@@ -16,9 +16,10 @@ import (
 func newResourceServer(loaders map[string][]*cacheReloader, health *pjutil.Health) *resourceServer {
 	logger := logrus.WithField("component", "pod-scaler request server")
 	server := &resourceServer{
-		logger:     logger,
-		lock:       sync.RWMutex{},
-		byMetaData: map[podscaler.FullMetadata]corev1.ResourceRequirements{},
+		logger:           logger,
+		lock:             sync.RWMutex{},
+		byMetaData:       map[podscaler.FullMetadata]corev1.ResourceRequirements{},
+		saturationStatus: map[podscaler.FullMetadata]SaturationStatus{},
 	}
 	digestAll(loaders, map[string]digester{
 		MetricNameCPUUsage:         server.digestCPU,
@@ -34,6 +35,15 @@ type resourceServer struct {
 	// byMetaData caches resource requirements calculated for the full assortment of
 	// metadata labels.
 	byMetaData map[podscaler.FullMetadata]corev1.ResourceRequirements
+	// saturationStatus tracks node saturation info per container metadata
+	saturationStatus map[podscaler.FullMetadata]SaturationStatus
+}
+
+// SaturationStatus tracks node saturation history for a container
+type SaturationStatus struct {
+	HasRecentSaturation bool // Any saturation in recent runs
+	SaturatedCount      int
+	TotalCount          int
 }
 
 const (
@@ -77,9 +87,17 @@ func (s *resourceServer) digestData(data *podscaler.CachedQuery, quantile float6
 		overall := circonusllhist.New()
 		metaLogger := logger.WithField("meta", meta)
 		metaLogger.Tracef("digesting %d fingerprints", len(fingerprintTimes))
+
+		saturatedCount := 0
+		// Only merge non-saturated runs into the histogram
 		for _, fingerprintTime := range fingerprintTimes {
-			overall.Merge(data.Data[fingerprintTime.Fingerprint].Histogram())
+			if !fingerprintTime.NodeSaturated {
+				overall.Merge(data.Data[fingerprintTime.Fingerprint].Histogram())
+			} else {
+				saturatedCount++
+			}
 		}
+
 		metaLogger.Trace("merged all fingerprints")
 		valueAtQuantile := overall.ValueAtQuantile(quantile)
 		metaLogger.Trace("locking for value update")
@@ -92,6 +110,22 @@ func (s *resourceServer) digestData(data *podscaler.CachedQuery, quantile float6
 		}
 		q := quantity(valueAtQuantile)
 		s.byMetaData[meta].Requests[request] = *q
+
+		// Track saturation status for CPU metrics
+		if request == corev1.ResourceCPU {
+			s.saturationStatus[meta] = SaturationStatus{
+				HasRecentSaturation: hasRecentSaturation(fingerprintTimes),
+				SaturatedCount:      saturatedCount,
+				TotalCount:          len(fingerprintTimes),
+			}
+			if saturatedCount > 0 {
+				metaLogger.WithFields(logrus.Fields{
+					"saturated_runs": saturatedCount,
+					"total_runs":     len(fingerprintTimes),
+				}).Debug("Container has saturated run history")
+			}
+		}
+
 		metaLogger.Trace("unlocking for meta")
 		s.lock.Unlock()
 	}
@@ -103,4 +137,26 @@ func (s *resourceServer) recommendedRequestFor(meta podscaler.FullMetadata) (cor
 	defer s.lock.RUnlock()
 	data, ok := s.byMetaData[meta]
 	return data, ok
+}
+
+func (s *resourceServer) getSaturationStatus(meta podscaler.FullMetadata) SaturationStatus {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.saturationStatus[meta]
+}
+
+// hasRecentSaturation checks if any of the last 10 runs experienced node saturation
+func hasRecentSaturation(fingerprintTimes []podscaler.FingerprintTime) bool {
+	recentRuns := 10
+	if len(fingerprintTimes) < recentRuns {
+		recentRuns = len(fingerprintTimes)
+	}
+	startIdx := len(fingerprintTimes) - recentRuns
+
+	for i := startIdx; i < len(fingerprintTimes); i++ {
+		if fingerprintTimes[i].NodeSaturated {
+			return true
+		}
+	}
+	return false
 }

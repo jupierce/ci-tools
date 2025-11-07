@@ -65,6 +65,24 @@ type CachedQuery struct {
 	// The list of fingerprintTimes is guaranteed to be unique for any set of labels
 	// and will never contain more than twenty-five items.
 	DataByMetaData map[FullMetadata][]FingerprintTime `json:"data_by_meta_data"`
+	// NodeSaturationData tracks node saturation information per fingerprint
+	NodeSaturationData map[model.Fingerprint]NodeSaturationInfo `json:"node_saturation_data,omitempty"`
+	// FingerprintToNamespace maps fingerprints to namespace/pod for saturation correlation
+	// This is not persisted to save space, only used during producer runs
+	FingerprintToNamespace map[model.Fingerprint]PodIdentifier `json:"-"`
+}
+
+// PodIdentifier holds namespace/pod information for correlation
+type PodIdentifier struct {
+	Namespace string
+	Pod       string
+}
+
+// NodeSaturationInfo stores information about node CPU saturation during a pod's execution
+type NodeSaturationInfo struct {
+	WasSaturated bool    `json:"was_saturated"`
+	NodeName     string  `json:"node_name,omitempty"`
+	MaxNodeCPU   float64 `json:"max_node_cpu,omitempty"` // Peak node CPU % during pod execution
 }
 
 // FingerprintTime holds both the fingerprint for referencing the data, and the time at which it was added for later pruning
@@ -73,6 +91,8 @@ type FingerprintTime struct {
 	Fingerprint model.Fingerprint `json:"fingerprint"`
 	// Added is the time which this was sourced. This is useful for later pruning of stale data.
 	Added time.Time `json:"added"`
+	// NodeSaturated indicates if the node this pod ran on had >80% CPU for >1min during pod lifetime
+	NodeSaturated bool `json:"node_saturated,omitempty"`
 }
 
 // Record adds the data in the matrix to the cache and records that the given cluster has
@@ -106,9 +126,35 @@ func (q *CachedQuery) Record(clusterName string, r TimeRange, matrix model.Matri
 		}
 		q.Data[fingerprint] = circonusllhist.NewHistogramWithoutLookups(hist)
 		if !seen {
+			// Initialize maps if needed
+			if q.NodeSaturationData == nil {
+				q.NodeSaturationData = make(map[model.Fingerprint]NodeSaturationInfo)
+			}
+			if q.FingerprintToNamespace == nil {
+				q.FingerprintToNamespace = make(map[model.Fingerprint]PodIdentifier)
+			}
+
+			// Store namespace/pod for saturation correlation
+			namespace := string(stream.Metric["namespace"])
+			pod := string(stream.Metric["pod"])
+			if namespace != "" && pod != "" {
+				q.FingerprintToNamespace[fingerprint] = PodIdentifier{
+					Namespace: namespace,
+					Pod:       pod,
+				}
+			}
+
+			// Initialize node saturation as not saturated
+			// This will be updated by detectNodeSaturation()
+			nodeSaturation := NodeSaturationInfo{
+				WasSaturated: false,
+			}
+			q.NodeSaturationData[fingerprint] = nodeSaturation
+
 			ft := FingerprintTime{
-				Fingerprint: fingerprint,
-				Added:       r.End, // We use the end time from the range as the added time, it is sufficient for pruning
+				Fingerprint:   fingerprint,
+				Added:         r.End, // We use the end time from the range as the added time, it is sufficient for pruning
+				NodeSaturated: nodeSaturation.WasSaturated,
 			}
 			q.DataByMetaData[meta] = append(q.DataByMetaData[meta], ft)
 		}

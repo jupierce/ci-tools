@@ -292,25 +292,190 @@ func preventUnschedulable(resources *corev1.ResourceRequirements, cpuCap int64, 
 	}
 }
 
+// containerInfo holds information about a container for saturation boost calculation
+type containerInfo struct {
+	index             int
+	isInit            bool
+	meta              podscaler.FullMetadata
+	baseCPUMillis     int64 // Final CPU request after all adjustments
+	measuredCPUMillis int64 // Actual measured CPU from histogram (80th percentile)
+	hasSaturation     bool
+	saturationStatus  SaturationStatus
+}
+
 func mutatePodResources(pod *corev1.Pod, server *resourceServer, mutateResourceLimits bool, cpuCap int64, memoryCap string, reporter results.PodScalerReporter, logger *logrus.Entry) {
-	mutateResources := func(containers []corev1.Container) {
-		for i := range containers {
-			meta := podscaler.MetadataFor(pod.ObjectMeta.Labels, pod.ObjectMeta.Name, containers[i].Name)
-			resources, recommendationExists := server.recommendedRequestFor(meta)
-			if recommendationExists {
-				logger.Debugf("recommendation exists for: %s", containers[i].Name)
-				workloadType := determineWorkloadType(pod.Annotations, pod.Labels)
-				workloadName := determineWorkloadName(pod.Name, containers[i].Name, workloadType, pod.Labels)
-				useOursIfLarger(&resources, &containers[i].Resources, workloadName, workloadType, reporter, logger)
-				if mutateResourceLimits {
-					reconcileLimits(&containers[i].Resources)
-				}
+	const maxPodCPUCores = 12
+
+	// First pass: apply base recommendations to all containers
+	var allContainers []containerInfo
+
+	// Process init containers
+	for i := range pod.Spec.InitContainers {
+		meta := podscaler.MetadataFor(pod.ObjectMeta.Labels, pod.ObjectMeta.Name, pod.Spec.InitContainers[i].Name)
+
+		// Capture measured CPU from histogram BEFORE any adjustments
+		measuredCPUMillis := int64(0)
+		resources, recommendationExists := server.recommendedRequestFor(meta)
+		if recommendationExists {
+			if cpu, ok := resources.Requests[corev1.ResourceCPU]; ok {
+				measuredCPUMillis = cpu.MilliValue()
 			}
-			preventUnschedulable(&containers[i].Resources, cpuCap, memoryCap, logger)
+
+			logger.Debugf("recommendation exists for init container: %s", pod.Spec.InitContainers[i].Name)
+			workloadType := determineWorkloadType(pod.Annotations, pod.Labels)
+			workloadName := determineWorkloadName(pod.Name, pod.Spec.InitContainers[i].Name, workloadType, pod.Labels)
+			useOursIfLarger(&resources, &pod.Spec.InitContainers[i].Resources, workloadName, workloadType, reporter, logger)
+			if mutateResourceLimits {
+				reconcileLimits(&pod.Spec.InitContainers[i].Resources)
+			}
+		}
+		preventUnschedulable(&pod.Spec.InitContainers[i].Resources, cpuCap, memoryCap, logger)
+
+		// Track for saturation boost calculation
+		satStatus := server.getSaturationStatus(meta)
+		finalCPUMillis := int64(0)
+		if cpu, ok := pod.Spec.InitContainers[i].Resources.Requests[corev1.ResourceCPU]; ok {
+			finalCPUMillis = cpu.MilliValue()
+		}
+		allContainers = append(allContainers, containerInfo{
+			index:             i,
+			isInit:            true,
+			meta:              meta,
+			baseCPUMillis:     finalCPUMillis,
+			measuredCPUMillis: measuredCPUMillis,
+			hasSaturation:     satStatus.HasRecentSaturation,
+			saturationStatus:  satStatus,
+		})
+	}
+
+	// Process regular containers
+	for i := range pod.Spec.Containers {
+		meta := podscaler.MetadataFor(pod.ObjectMeta.Labels, pod.ObjectMeta.Name, pod.Spec.Containers[i].Name)
+
+		// Capture measured CPU from histogram BEFORE any adjustments
+		measuredCPUMillis := int64(0)
+		resources, recommendationExists := server.recommendedRequestFor(meta)
+		if recommendationExists {
+			if cpu, ok := resources.Requests[corev1.ResourceCPU]; ok {
+				measuredCPUMillis = cpu.MilliValue()
+			}
+
+			logger.Debugf("recommendation exists for: %s", pod.Spec.Containers[i].Name)
+			workloadType := determineWorkloadType(pod.Annotations, pod.Labels)
+			workloadName := determineWorkloadName(pod.Name, pod.Spec.Containers[i].Name, workloadType, pod.Labels)
+			useOursIfLarger(&resources, &pod.Spec.Containers[i].Resources, workloadName, workloadType, reporter, logger)
+			if mutateResourceLimits {
+				reconcileLimits(&pod.Spec.Containers[i].Resources)
+			}
+		}
+		preventUnschedulable(&pod.Spec.Containers[i].Resources, cpuCap, memoryCap, logger)
+
+		// Track for saturation boost calculation
+		satStatus := server.getSaturationStatus(meta)
+		finalCPUMillis := int64(0)
+		if cpu, ok := pod.Spec.Containers[i].Resources.Requests[corev1.ResourceCPU]; ok {
+			finalCPUMillis = cpu.MilliValue()
+		}
+		allContainers = append(allContainers, containerInfo{
+			index:             i,
+			isInit:            false,
+			meta:              meta,
+			baseCPUMillis:     finalCPUMillis,
+			measuredCPUMillis: measuredCPUMillis,
+			hasSaturation:     satStatus.HasRecentSaturation,
+			saturationStatus:  satStatus,
+		})
+	}
+
+	// Second pass: apply saturation boost to longest-running container if needed
+	applySaturationBoost(pod, allContainers, maxPodCPUCores, logger)
+}
+
+// applySaturationBoost adds CPU to the longest-running container if any container experienced saturation
+func applySaturationBoost(pod *corev1.Pod, containers []containerInfo, maxPodCPUCores int, logger *logrus.Entry) {
+	// Check if any container has recent saturation
+	anySaturation := false
+	for _, c := range containers {
+		if c.hasSaturation {
+			anySaturation = true
+			break
 		}
 	}
-	mutateResources(pod.Spec.InitContainers)
-	mutateResources(pod.Spec.Containers)
+
+	if !anySaturation {
+		return // No saturation, no boost needed
+	}
+
+	// Find the longest-running container based on actual measured CPU consumption
+	// (the one that uses the most CPU cores in practice, not configured request)
+	longestRunningIdx := -1
+	maxMeasuredCPU := int64(0)
+	for i, c := range containers {
+		// measuredCPUMillis contains the actual measured CPU from histogram (80th percentile)
+		// This represents actual CPU consumption from non-saturated runs
+		if c.measuredCPUMillis > maxMeasuredCPU {
+			maxMeasuredCPU = c.measuredCPUMillis
+			longestRunningIdx = i
+		}
+	}
+
+	if longestRunningIdx == -1 {
+		return // No containers with CPU measurements
+	}
+
+	// Calculate current total pod CPU
+	totalPodCPUMillis := int64(0)
+	for _, c := range containers {
+		totalPodCPUMillis += c.baseCPUMillis
+	}
+
+	// Calculate boost (1 core = 1000 millicores)
+	boostMillis := int64(1000)
+	maxPodCPUMillis := int64(maxPodCPUCores * 1000)
+
+	// Ensure we don't exceed pod limit
+	if totalPodCPUMillis+boostMillis > maxPodCPUMillis {
+		boostMillis = maxPodCPUMillis - totalPodCPUMillis
+		if boostMillis <= 0 {
+			logger.Debugf("Pod already at or above %d core limit, skipping saturation boost", maxPodCPUCores)
+			return
+		}
+	}
+
+	// Apply boost to the longest-running container
+	longestContainer := containers[longestRunningIdx]
+	var targetContainer *corev1.Container
+	if longestContainer.isInit {
+		targetContainer = &pod.Spec.InitContainers[longestContainer.index]
+	} else {
+		targetContainer = &pod.Spec.Containers[longestContainer.index]
+	}
+
+	if targetContainer.Resources.Requests == nil {
+		targetContainer.Resources.Requests = corev1.ResourceList{}
+	}
+
+	currentCPU := targetContainer.Resources.Requests[corev1.ResourceCPU]
+	newCPU := currentCPU.DeepCopy()
+	newCPU.Add(*resource.NewMilliQuantity(boostMillis, resource.DecimalSI))
+	targetContainer.Resources.Requests[corev1.ResourceCPU] = newCPU
+
+	// Annotate pod with boost information
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations["ci.openshift.io/pod-scaler-cpu-boost-millicores"] = fmt.Sprintf("%d", boostMillis)
+	pod.Annotations["ci.openshift.io/pod-scaler-boosted-container"] = targetContainer.Name
+
+	logger.WithFields(logrus.Fields{
+		"container":            targetContainer.Name,
+		"boost_millicores":     boostMillis,
+		"measured_cpu":         longestContainer.measuredCPUMillis,
+		"original_request_cpu": currentCPU.MilliValue(),
+		"new_request_cpu":      newCPU.MilliValue(),
+		"total_pod_cpu":        totalPodCPUMillis + boostMillis,
+		"saturation_reason":    fmt.Sprintf("%d/%d runs saturated", longestContainer.saturationStatus.SaturatedCount, longestContainer.saturationStatus.TotalCount),
+	}).Info("Applied CPU boost to longest-running container due to node saturation")
 }
 
 const (

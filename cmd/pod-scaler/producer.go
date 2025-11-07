@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -96,14 +97,21 @@ func produce(clients map[string]prometheusapi.API, dataCache Cache, ignoreLatest
 					ranges[cluster] = []podscaler.TimeRange{}
 				}
 				cache = &podscaler.CachedQuery{
-					Query:           query,
-					RangesByCluster: ranges,
-					Data:            map[model.Fingerprint]*circonusllhist.HistogramWithoutLookups{},
-					DataByMetaData:  map[podscaler.FullMetadata][]podscaler.FingerprintTime{},
+					Query:                  query,
+					RangesByCluster:        ranges,
+					Data:                   map[model.Fingerprint]*circonusllhist.HistogramWithoutLookups{},
+					DataByMetaData:         map[podscaler.FullMetadata][]podscaler.FingerprintTime{},
+					NodeSaturationData:     map[model.Fingerprint]podscaler.NodeSaturationInfo{},
+					FingerprintToNamespace: map[model.Fingerprint]podscaler.PodIdentifier{},
 				}
 			} else if err != nil {
 				logrus.WithError(err).Error("Failed to load data from storage.")
 				continue
+			} else {
+				// Initialize FingerprintToNamespace map (not persisted, so rebuild on load)
+				if cache.FingerprintToNamespace == nil {
+					cache.FingerprintToNamespace = make(map[model.Fingerprint]podscaler.PodIdentifier)
+				}
 			}
 			until := time.Now().Add(-ignoreLatest)
 			q := querier{
@@ -138,6 +146,12 @@ func produce(clients map[string]prometheusapi.API, dataCache Cache, ignoreLatest
 				}()
 			}
 			wg.Wait()
+
+			// After collecting container metrics, detect node saturation
+			if strings.Contains(name, MetricNameCPUUsage) {
+				detectNodeSaturation(clients, cache, until, logger)
+			}
+
 			if err := storeCache(dataCache, name, cache, logger); err != nil {
 				logger.WithError(err).Error("Failed to write cached data.")
 			}
@@ -371,4 +385,256 @@ func (q *querier) executeOverRange(ctx context.Context, c *clusterMetadata, r pr
 	q.data.Record(c.name, rangeFrom(r), matrix, logger)
 	q.lock.Unlock()
 	logger.Debugf("Saved Prometheus response after %s.", time.Since(saveStart).Round(time.Second))
+}
+
+// detectNodeSaturation queries node CPU metrics and marks pods that ran on saturated nodes
+func detectNodeSaturation(clients map[string]prometheusapi.API, cache *podscaler.CachedQuery, until time.Time, logger *logrus.Entry) {
+	logger.Info("Detecting node saturation for pod executions")
+
+	ctx := interrupts.Context()
+	saturationThreshold := 0.8  // 80% CPU utilization
+	minSaturationDuration := 60 // seconds
+
+	for clusterName, client := range clients {
+		clusterLogger := logger.WithField("cluster", clusterName)
+
+		// Get the time range we're analyzing (same as container metrics)
+		runtime, err := client.Runtimeinfo(ctx)
+		if err != nil {
+			clusterLogger.WithError(err).Warn("Could not query Prometheus runtime info for node saturation detection")
+			continue
+		}
+		storageRetention := runtime.StorageRetention
+		parts := strings.Split(storageRetention, " ")
+		retention, err := model.ParseDuration(parts[0])
+		if err != nil {
+			clusterLogger.WithError(err).Warn("Could not determine Prometheus retention duration")
+			continue
+		}
+
+		start := time.Now().Add(-time.Duration(retention))
+		end := until
+
+		// Query 1: Get pod info (namespace, pod, node, start time)
+		// kube_pod_info provides the pod-to-node mapping
+		podInfoQuery := `kube_pod_info{node!=""}`
+		clusterLogger.Debug("Querying kube_pod_info for pod-to-node mapping")
+
+		podInfoResult, warnings, err := client.QueryRange(ctx, podInfoQuery, prometheusapi.Range{
+			Start: start,
+			End:   end,
+			Step:  1 * time.Minute,
+		})
+
+		if err != nil {
+			clusterLogger.WithError(err).Warn("Failed to query kube_pod_info")
+			continue
+		}
+		if len(warnings) > 0 {
+			clusterLogger.WithField("warnings", warnings).Debug("Got warnings from kube_pod_info query")
+		}
+
+		podInfoMatrix, ok := podInfoResult.(model.Matrix)
+		if !ok {
+			clusterLogger.Warn("kube_pod_info result is not a matrix")
+			continue
+		}
+
+		// Build pod-to-node mapping with timing
+		type podInfo struct {
+			namespace string
+			pod       string
+			node      string
+			startTime time.Time
+			endTime   time.Time
+		}
+
+		podToNode := make(map[string]podInfo) // key: "namespace/pod"
+		for _, stream := range podInfoMatrix {
+			namespace := string(stream.Metric["namespace"])
+			pod := string(stream.Metric["pod"])
+			node := string(stream.Metric["node"])
+
+			if namespace == "" || pod == "" || node == "" {
+				continue
+			}
+
+			key := fmt.Sprintf("%s/%s", namespace, pod)
+
+			// Get time range from values
+			if len(stream.Values) > 0 {
+				startTime := stream.Values[0].Timestamp.Time()
+				endTime := stream.Values[len(stream.Values)-1].Timestamp.Time()
+
+				podToNode[key] = podInfo{
+					namespace: namespace,
+					pod:       pod,
+					node:      node,
+					startTime: startTime,
+					endTime:   endTime,
+				}
+			}
+		}
+
+		clusterLogger.Debugf("Mapped %d pods to nodes", len(podToNode))
+
+		// Query 2: Get node CPU utilization
+		// Calculate CPU utilization: 1 - avg(idle_time)
+		nodeCPUQuery := `1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[1m]))`
+		clusterLogger.Debug("Querying node CPU utilization")
+
+		nodeCPUResult, warnings, err := client.QueryRange(ctx, nodeCPUQuery, prometheusapi.Range{
+			Start: start,
+			End:   end,
+			Step:  1 * time.Minute,
+		})
+
+		if err != nil {
+			clusterLogger.WithError(err).Warn("Failed to query node CPU metrics")
+			continue
+		}
+		if len(warnings) > 0 {
+			clusterLogger.WithField("warnings", warnings).Debug("Got warnings from node CPU query")
+		}
+
+		nodeCPUMatrix, ok := nodeCPUResult.(model.Matrix)
+		if !ok {
+			clusterLogger.Warn("Node CPU result is not a matrix")
+			continue
+		}
+
+		// Build node CPU timeline: node -> (time -> cpuUtilization)
+		nodeCPUTimeline := make(map[string]map[time.Time]float64)
+		for _, stream := range nodeCPUMatrix {
+			node := string(stream.Metric["node"])
+			if node == "" {
+				continue
+			}
+
+			if nodeCPUTimeline[node] == nil {
+				nodeCPUTimeline[node] = make(map[time.Time]float64)
+			}
+
+			for _, value := range stream.Values {
+				nodeCPUTimeline[node][value.Timestamp.Time()] = float64(value.Value)
+			}
+		}
+
+		clusterLogger.Debugf("Collected CPU data for %d nodes", len(nodeCPUTimeline))
+
+		// Correlate: For each pod in our cache, check if its node was saturated
+		saturatedCount := 0
+		checkedCount := 0
+
+		for meta, fingerprintTimes := range cache.DataByMetaData {
+			for i, ft := range fingerprintTimes {
+				// Get namespace/pod for this fingerprint
+				namespace, pod, exists := findPodForFingerprint(cache, ft.Fingerprint)
+				if !exists || namespace == "" || pod == "" {
+					continue
+				}
+
+				podKey := fmt.Sprintf("%s/%s", namespace, pod)
+				podInf, hasPodInfo := podToNode[podKey]
+				if !hasPodInfo {
+					continue
+				}
+
+				checkedCount++
+
+				// Check if this pod's node was saturated during pod lifetime
+				nodeCPU, hasNodeCPU := nodeCPUTimeline[podInf.node]
+				if !hasNodeCPU {
+					continue
+				}
+
+				// Check for sustained saturation (>80% for >1 minute)
+				wasSaturated, maxCPU := checkNodeSaturation(nodeCPU, podInf.startTime, podInf.endTime, saturationThreshold, minSaturationDuration)
+
+				if wasSaturated {
+					saturatedCount++
+
+					// Update the fingerprint time
+					cache.DataByMetaData[meta][i].NodeSaturated = true
+
+					// Update node saturation data
+					if cache.NodeSaturationData == nil {
+						cache.NodeSaturationData = make(map[model.Fingerprint]podscaler.NodeSaturationInfo)
+					}
+					cache.NodeSaturationData[ft.Fingerprint] = podscaler.NodeSaturationInfo{
+						WasSaturated: true,
+						NodeName:     podInf.node,
+						MaxNodeCPU:   maxCPU,
+					}
+				}
+			}
+		}
+
+		clusterLogger.WithFields(logrus.Fields{
+			"checked":   checkedCount,
+			"saturated": saturatedCount,
+		}).Info("Completed node saturation detection")
+	}
+}
+
+// findPodForFingerprint finds the namespace/pod associated with a fingerprint
+func findPodForFingerprint(cache *podscaler.CachedQuery, fingerprint model.Fingerprint) (string, string, bool) {
+	if cache.FingerprintToNamespace == nil {
+		return "", "", false
+	}
+
+	podIdent, exists := cache.FingerprintToNamespace[fingerprint]
+	if !exists {
+		return "", "", false
+	}
+
+	return podIdent.Namespace, podIdent.Pod, true
+}
+
+// checkNodeSaturation determines if a node was saturated during a time period
+// Returns (wasSaturated bool, maxCPU float64)
+func checkNodeSaturation(nodeCPU map[time.Time]float64, podStart, podEnd time.Time, threshold float64, minDurationSeconds int) (bool, float64) {
+	// Get CPU samples during pod lifetime
+	var samplesInRange []struct {
+		time time.Time
+		cpu  float64
+	}
+
+	maxCPU := 0.0
+	for t, cpu := range nodeCPU {
+		if (t.Equal(podStart) || t.After(podStart)) && (t.Equal(podEnd) || t.Before(podEnd)) {
+			samplesInRange = append(samplesInRange, struct {
+				time time.Time
+				cpu  float64
+			}{t, cpu})
+
+			if cpu > maxCPU {
+				maxCPU = cpu
+			}
+		}
+	}
+
+	if len(samplesInRange) == 0 {
+		return false, 0
+	}
+
+	// Sort by time
+	sort.Slice(samplesInRange, func(i, j int) bool {
+		return samplesInRange[i].time.Before(samplesInRange[j].time)
+	})
+
+	// Check for sustained saturation (consecutive samples above threshold)
+	consecutiveSaturatedSeconds := 0
+	for _, sample := range samplesInRange {
+		if sample.cpu >= threshold {
+			consecutiveSaturatedSeconds += 60 // Each sample is 1 minute apart
+			if consecutiveSaturatedSeconds >= minDurationSeconds {
+				return true, maxCPU
+			}
+		} else {
+			consecutiveSaturatedSeconds = 0
+		}
+	}
+
+	return false, maxCPU
 }
